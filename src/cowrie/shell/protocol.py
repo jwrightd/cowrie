@@ -20,6 +20,7 @@ from twisted.protocols.policies import TimeoutMixin
 from twisted.python import failure, log
 
 import cowrie.commands
+from cowrie.adaptive.cowrie_adapter import get_adapter
 from cowrie.core.config import CowrieConfig
 from cowrie.core.resources import read_data_bytes
 from cowrie.shell import command, honeypot
@@ -128,6 +129,8 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             except Exception:
                 self.kippoIPv6 = ""
 
+        get_adapter().session_started(self)
+
     def timeoutConnection(self) -> None:
         """
         this logs out when connection times out
@@ -141,6 +144,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         Clear any circular references here, and any external references to
         this Protocol. The connection has been closed.
         """
+        get_adapter().session_ended(self)
         self.setTimeout(None)
         insults.TerminalProtocol.connectionLost(self, reason)
         self.terminal = None  # (this should be done by super above)

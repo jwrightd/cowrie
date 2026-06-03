@@ -16,6 +16,8 @@ from twisted.internet import error
 from twisted.python import failure, log
 from twisted.python.compat import iterbytes
 
+from cowrie.adaptive.cowrie_adapter import get_adapter
+from cowrie.adaptive.spec import registry as adaptive_registry
 from cowrie.core.config import CowrieConfig
 from cowrie.shell import fs
 from cowrie.shell.parser import CommandParser
@@ -429,15 +431,46 @@ class HoneyPotShell:
             )
 
         lastpp = None
+        observed_sequences: dict[int, list[dict[str, Any]]] = {}
+        for index, cmd in enumerate(cmd_array):
+            _seq_index, _seq_hash, commands = get_adapter().command_observed(
+                self.protocol, cmd["command"], cmd["rargs"]
+            )
+            observed_sequences[index] = commands
+
         for index, cmd in reversed(list(enumerate(cmd_array))):
             cmdclass = self.protocol.getCommand(
                 cmd["command"], environ["PATH"].split(":")
             )
             if cmdclass:
+                get_adapter().command_handled(
+                    self.protocol,
+                    cmd["command"],
+                    cmd["rargs"],
+                    getattr(cmdclass, "__name__", repr(cmdclass)),
+                )
                 log.msg(
                     input=cmd["command"] + " " + " ".join(cmd["rargs"]),
                     format="Command found: %(input)s",
                 )
+            else:
+                cmdclass = adaptive_registry.command_class(
+                    cmd["command"], cmd["rargs"]
+                )
+                if cmdclass:
+                    get_adapter().command_handled(
+                        self.protocol,
+                        cmd["command"],
+                        cmd["rargs"],
+                        getattr(cmdclass, "__name__", repr(cmdclass)),
+                    )
+                    log.msg(
+                        eventid="cowrie.adaptive.command.handled",
+                        input=cmd["command"] + " " + " ".join(cmd["rargs"]),
+                        format="Adaptive command found: %(input)s",
+                    )
+
+            if cmdclass:
                 if index == len(cmd_array) - 1:
                     lastpp = PipeProtocol(
                         self.protocol,
@@ -461,6 +494,12 @@ class HoneyPotShell:
                     )
                     lastpp = pp
             else:
+                get_adapter().command_missed(
+                    self.protocol,
+                    cmd["command"],
+                    cmd["rargs"],
+                    observed_sequences.get(index),
+                )
                 log.msg(
                     eventid="cowrie.command.failed",
                     input=cmd["command"] + " " + " ".join(cmd["rargs"]),

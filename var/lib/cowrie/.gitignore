@@ -1,3 +1,4 @@
 ssh_host_*
 auth_random.json
 uuid
+adaptive_behaviors.json

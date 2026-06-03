@@ -927,6 +927,20 @@ db = cowrie
 enabled = false
 db_file = cowrie.db
 
+
+# Adaptive honeypot sidecar integration
+#
+# When enabled, Cowrie emits adapter-neutral session/command events to the
+# sidecar. The behavior_file contains validated declarative handlers returned
+# by /behavior/latest and can be updated without restarting Cowrie.
+#
+[adaptive]
+enabled = false
+sidecar_url = http://127.0.0.1:8088
+timeout = 2.0
+behavior_poll_interval = 1.0
+behavior_file =
+
 # MongoDB logging module
 #
 # MongoDB logging requires an extra Python module: pip install pymongo

@@ -1,0 +1,235 @@
+# SPDX-FileCopyrightText: 2026 Michel Oosterhof <michel@oosterhof.net>
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import traceback
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import urlparse
+
+from cowrie.adaptive import EVENT_COMMAND_MISSED
+from cowrie.adaptive.intake import sanitized_hash
+from cowrie.adaptive.llm_specs import DeclarativeSpecGenerator, SpecGenerationError
+from cowrie.adaptive.spec import SpecValidationError, parse_behavior_spec
+from cowrie.adaptive.store import MemoryStore, PostgresStore, dumps_json
+from cowrie.adaptive.triage import DeterministicTriage
+
+
+class AdaptiveSidecar:
+    def __init__(self, store: Any, generator: DeclarativeSpecGenerator | None = None):
+        self.store = store
+        self.triage = DeterministicTriage()
+        self.generator = generator or DeclarativeSpecGenerator()
+        self.recent_results: list[dict[str, Any]] = []
+
+    def receive_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        self.store.store_event(event)
+        response = {"stored": True, "queued": False}
+        if event.get("event_type") != EVENT_COMMAND_MISSED or self.store.frozen:
+            self._remember({**response, "event_type": event.get("event_type")})
+            return response
+
+        decision = self.triage.decide(event)
+        response.update(
+            {
+                "triage_reason": decision.reason,
+                "novelty_score": decision.novelty_score,
+            }
+        )
+        if not decision.enqueue:
+            self._remember({**response, "status": "skipped"})
+            return response
+
+        attempt = {
+            "session_id": event.get("session_id"),
+            "sanitized_input_hash": sanitized_hash(event.get("payload", {})),
+            "prompt_metadata": {
+                "event_type": event.get("event_type"),
+                "sequence_hash": event.get("sequence_hash"),
+                "model": self.generator.model,
+            },
+            "generated_spec": None,
+            "validator_failures": [],
+            "retry_count": 0,
+            "status": "queued",
+        }
+        self.store.record_patch_attempt(attempt)
+        response.update({"queued": True, "status": "generation_started"})
+        self._remember(
+            {
+                **response,
+                "command": event.get("payload", {}).get("command", ""),
+                "session_id": event.get("session_id"),
+            }
+        )
+        threading.Thread(
+            target=self._generate_and_publish,
+            args=(event, attempt),
+            daemon=True,
+        ).start()
+        return response
+
+    def _generate_and_publish(
+        self, event: dict[str, Any], attempt: dict[str, Any]
+    ) -> None:
+        try:
+            spec = self.generator.generate(event)
+            parse_behavior_spec(spec)
+        except SpecGenerationError:
+            attempt["status"] = "queued_no_llm"
+            self.store.record_patch_attempt(attempt)
+            self._remember(
+                {
+                    "stored": True,
+                    "queued": True,
+                    "status": "queued_no_llm",
+                    "command": event.get("payload", {}).get("command", ""),
+                    "session_id": event.get("session_id"),
+                }
+            )
+            return
+        except (OSError, json.JSONDecodeError, KeyError, SpecValidationError) as e:
+            attempt["validator_failures"] = [repr(e)]
+            attempt["status"] = "rejected"
+            self.store.record_patch_attempt(attempt)
+            self._remember(
+                {
+                    "stored": True,
+                    "queued": True,
+                    "status": "rejected",
+                    "error": repr(e),
+                    "command": event.get("payload", {}).get("command", ""),
+                    "session_id": event.get("session_id"),
+                }
+            )
+            return
+        except Exception as e:
+            attempt["validator_failures"] = [traceback.format_exc()]
+            attempt["status"] = "error"
+            self.store.record_patch_attempt(attempt)
+            self._remember(
+                {
+                    "stored": True,
+                    "queued": True,
+                    "status": "error",
+                    "error": repr(e),
+                    "command": event.get("payload", {}).get("command", ""),
+                    "session_id": event.get("session_id"),
+                }
+            )
+            return
+
+        attempt["generated_spec"] = spec
+        attempt["status"] = "accepted"
+        self.store.record_patch_attempt(attempt)
+        version = self.store.publish_behavior_spec(spec)
+        self._remember(
+            {
+                "stored": True,
+                "queued": True,
+                "status": "accepted",
+                "version": version,
+                "command": spec.get("command", ""),
+                "session_id": event.get("session_id"),
+            }
+        )
+
+    def latest_behavior(self) -> dict[str, Any]:
+        return self.store.latest_behavior()
+
+    def reload_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        self.store.store_event(
+            {
+                "event_type": "behavior_reload_result",
+                "session_id": result.get("session_id", "control-plane"),
+                "sequence_index": 0,
+                "sequence_hash": "",
+                "payload": result,
+            }
+        )
+        return {"stored": True}
+
+    def freeze(self) -> dict[str, Any]:
+        self.store.freeze()
+        return {"frozen": True}
+
+    def debug_recent(self) -> dict[str, Any]:
+        return {"recent_results": list(self.recent_results)}
+
+    def _remember(self, result: dict[str, Any]) -> None:
+        result = {**result, "time": time.time()}
+        self.recent_results.append(result)
+        self.recent_results = self.recent_results[-50:]
+        print(f"adaptive sidecar event result: {json.dumps(result, sort_keys=True)}", flush=True)  # noqa: T201
+
+
+def make_store() -> Any:
+    dsn = os.environ.get("ADAPTIVE_POSTGRES_DSN", "")
+    if dsn:
+        return PostgresStore(dsn)
+    return MemoryStore()
+
+
+def make_handler(sidecar: AdaptiveSidecar) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = self._read_json()
+            path = urlparse(self.path).path
+            if path == "/events":
+                self._write_json(sidecar.receive_event(body))
+            elif path == "/behavior/reload-result":
+                self._write_json(sidecar.reload_result(body))
+            elif path == "/control/freeze":
+                self._write_json(sidecar.freeze())
+            else:
+                self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+        def do_GET(self) -> None:
+            path = urlparse(self.path).path
+            if path == "/behavior/latest":
+                self._write_json(sidecar.latest_behavior())
+            elif path == "/debug/recent":
+                self._write_json(sidecar.debug_recent())
+            else:
+                self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def _read_json(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length == 0:
+                return {}
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+
+        def _write_json(
+            self, data: dict[str, Any], status: HTTPStatus = HTTPStatus.OK
+        ) -> None:
+            body = dumps_json(data)
+            self.send_response(int(status))
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
+def main() -> None:
+    host = os.environ.get("ADAPTIVE_SIDECAR_HOST", "127.0.0.1")
+    port = int(os.environ.get("ADAPTIVE_SIDECAR_PORT", "8088"))
+    sidecar = AdaptiveSidecar(make_store())
+    server = ThreadingHTTPServer((host, port), make_handler(sidecar))
+    print(f"adaptive sidecar listening on http://{host}:{port}")  # noqa: T201
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
