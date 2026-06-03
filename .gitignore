@@ -13,6 +13,9 @@ build/
 log/
 .eggs/
 .envrc
+.env
+.env.*
+!.env.example
 .direnv/
 .pyre*
 .pytype/
