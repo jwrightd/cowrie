@@ -59,6 +59,7 @@ createfs = "cowrie.scripts.createfs:run"
 dumpfs = "cowrie.scripts.dumpfs:run"
 playlog = "cowrie.scripts.playlog:run"
 adaptive-sidecar = "cowrie.adaptive.sidecar:main"
+adaptive-rag-seed = "cowrie.adaptive.rag_seed:main"
 
 [project.optional-dependencies]
 csirtg = ["csirtgsdk==1.1.5"]

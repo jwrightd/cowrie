@@ -62,7 +62,6 @@ class DeterministicTriage:
     """Cheap gate before any LLM work."""
 
     def __init__(self) -> None:
-        self._seen_signatures: set[str] = set()
         self._rate_limiter = RateLimiter()
 
     def decide(self, event: dict[str, Any]) -> TriageDecision:
@@ -71,11 +70,6 @@ class DeterministicTriage:
         invalid_reason = invalid_linux_command_reason(command)
         if invalid_reason:
             return TriageDecision(False, invalid_reason, 0.0)
-
-        signature = miss_signature(payload)
-        if signature in self._seen_signatures:
-            return TriageDecision(False, "duplicate_miss", 0.1)
-        self._seen_signatures.add(signature)
 
         source = payload.get("src_ip") or event.get("session_id", "unknown")
         if not self._rate_limiter.allow(str(source)):

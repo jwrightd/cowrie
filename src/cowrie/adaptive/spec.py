@@ -57,6 +57,7 @@ class BehaviorSpec:
     fs_effects: list[FileEffect] = field(default_factory=list)
     state_effects: dict[str, str] = field(default_factory=dict)
     spec_id: str | None = None
+    handler_id: int | None = None
     version: int = 1
 
 
@@ -138,6 +139,24 @@ def _validate_fs_effects(value: Any) -> list[FileEffect]:
     return effects
 
 
+def _validate_state_effects(value: Any) -> dict[str, str]:
+    if value in (None, []):
+        return {}
+    if not isinstance(value, dict):
+        raise SpecValidationError("state_effects must be an object")
+    clean_effects = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise SpecValidationError("state_effects keys must be strings")
+        if isinstance(item, str):
+            clean_effects[key] = item
+        elif isinstance(item, (bool, int, float)) or item is None:
+            clean_effects[key] = "" if item is None else str(item)
+        else:
+            raise SpecValidationError("state_effects values must be scalar")
+    return clean_effects
+
+
 def parse_behavior_spec(raw: dict[str, Any]) -> BehaviorSpec:
     data = _require_dict(raw, "behavior spec")
     command = data.get("command")
@@ -151,13 +170,7 @@ def parse_behavior_spec(raw: dict[str, Any]) -> BehaviorSpec:
     exit_status = data.get("exit_status", 0)
     if not isinstance(exit_status, int) or exit_status < 0 or exit_status > 255:
         raise SpecValidationError("exit_status must be between 0 and 255")
-    state_effects = data.get("state_effects", {})
-    if state_effects in (None, []):
-        state_effects = {}
-    if not isinstance(state_effects, dict) or not all(
-        isinstance(k, str) and isinstance(v, str) for k, v in state_effects.items()
-    ):
-        raise SpecValidationError("state_effects must be a string map")
+    state_effects = _validate_state_effects(data.get("state_effects", {}))
     return BehaviorSpec(
         command=command,
         argv_match=_validate_argv_match(data.get("argv_match", {})),
@@ -169,8 +182,52 @@ def parse_behavior_spec(raw: dict[str, Any]) -> BehaviorSpec:
         fs_effects=_validate_fs_effects(data.get("fs_effects", [])),
         state_effects=state_effects,
         spec_id=data.get("spec_id"),
+        handler_id=data.get("id") if isinstance(data.get("id"), int) else None,
         version=int(data.get("version", 1)),
     )
+
+
+def behavior_spec_to_dict(spec: BehaviorSpec) -> dict[str, Any]:
+    return {
+        "command": spec.command,
+        "argv_match": spec.argv_match,
+        "response": {
+            "stdout": spec.response.stdout,
+            "stderr": spec.response.stderr,
+        },
+        "exit_status": spec.exit_status,
+        "fs_effects": [
+            {
+                "path": effect.path,
+                "content": effect.content,
+                "mode": effect.mode,
+            }
+            for effect in spec.fs_effects
+        ],
+        "state_effects": spec.state_effects,
+        **({"spec_id": spec.spec_id} if spec.spec_id else {}),
+        **({"id": spec.handler_id} if spec.handler_id is not None else {}),
+        "version": spec.version,
+    }
+
+
+def normalize_behavior_spec(raw: dict[str, Any]) -> dict[str, Any]:
+    return behavior_spec_to_dict(parse_behavior_spec(raw))
+
+
+def normalize_matching_behavior_spec(
+    raw: dict[str, Any], command: str, argv: list[str]
+) -> dict[str, Any]:
+    spec = parse_behavior_spec(raw)
+    if spec.command != command:
+        raise SpecValidationError("generated command does not match missed command")
+    if not argv_matches(spec, argv):
+        narrowed = dict(raw)
+        narrowed["argv_match"] = {"mode": "exact", "patterns": argv}
+        spec = parse_behavior_spec(narrowed)
+        if not argv_matches(spec, argv):
+            raise SpecValidationError("generated argv_match does not match missed argv")
+    return behavior_spec_to_dict(spec)
 
 
 def load_behavior_specs(path: str) -> list[BehaviorSpec]:
@@ -323,23 +380,44 @@ class BehaviorRegistry:
         ).rstrip("/")
         timeout = CowrieConfig.getfloat("adaptive", "timeout", fallback=2.0)
         try:
-            with urllib.request.urlopen(
-                f"{base_url}/behavior/latest", timeout=timeout
-            ) as response:
+            url = f"{base_url}/behavior/latest?since_version={max(self._remote_version, 0)}"
+            with urllib.request.urlopen(url, timeout=timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
             raw_specs = data.get("handlers", [])
             if not isinstance(raw_specs, list):
                 raise SpecValidationError("handlers must be a list")
+            retired_handler_ids = data.get("retired_handler_ids", [])
+            if not isinstance(retired_handler_ids, list):
+                raise SpecValidationError("retired_handler_ids must be a list")
             version = int(data.get("version", 0))
             if version == self._remote_version:
                 return
             specs = [parse_behavior_spec(item) for item in raw_specs]
+            if self._remote_version <= 0:
+                self._remote_specs = specs
+            else:
+                retired = {
+                    item for item in retired_handler_ids if isinstance(item, int)
+                }
+                existing = [
+                    spec
+                    for spec in self._remote_specs
+                    if spec.handler_id is None or spec.handler_id not in retired
+                ]
+                new_ids = {
+                    spec.handler_id for spec in specs if spec.handler_id is not None
+                }
+                existing = [
+                    spec
+                    for spec in existing
+                    if spec.handler_id is None or spec.handler_id not in new_ids
+                ]
+                self._remote_specs = [*existing, *specs]
             self._remote_version = version
-            self._remote_specs = specs
             self._last_remote_error = ""
             self._merge_specs()
             log.msg(
-                f"adaptive loaded {len(specs)} behavior specs "
+                f"adaptive loaded {len(self._remote_specs)} behavior specs "
                 f"from {base_url}/behavior/latest version {version}"
             )
         except (

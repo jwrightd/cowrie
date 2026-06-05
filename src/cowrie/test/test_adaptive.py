@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 import unittest
@@ -19,6 +20,12 @@ from cowrie.adaptive.cowrie_adapter import (
     CowrieAdaptiveAdapter,
     set_adapter_for_tests,
 )
+from cowrie.adaptive.llm_specs import (
+    DeclarativeSpecGenerator,
+    LLMClient,
+    SpecGenerationError,
+)
+from cowrie.adaptive.rag import EmbeddingClient, RagRetriever
 from cowrie.adaptive.sidecar import AdaptiveSidecar
 from cowrie.adaptive.spec import SpecValidationError, parse_behavior_spec, registry
 from cowrie.adaptive.store import MemoryStore
@@ -160,6 +167,37 @@ class AdaptiveSpecTests(unittest.TestCase):
         )
         self.assertEqual(spec.state_effects, {})
 
+    def test_coerces_scalar_state_effect_values_to_strings(self) -> None:
+        spec = parse_behavior_spec(
+            {
+                "command": "ss",
+                "response": {"stdout": "ok\n", "stderr": ""},
+                "state_effects": {
+                    "last_exit_status": 0,
+                    "has_socket_snapshot": True,
+                    "last_error": None,
+                },
+            }
+        )
+        self.assertEqual(
+            spec.state_effects,
+            {
+                "last_exit_status": "0",
+                "has_socket_snapshot": "True",
+                "last_error": "",
+            },
+        )
+
+    def test_rejects_nested_state_effect_values(self) -> None:
+        with self.assertRaises(SpecValidationError):
+            parse_behavior_spec(
+                {
+                    "command": "ss",
+                    "response": {"stdout": "ok\n", "stderr": ""},
+                    "state_effects": {"snapshot": {"ports": [22]}},
+                }
+            )
+
     def test_accepts_argv_match_list_as_prefix_matcher(self) -> None:
         spec = parse_behavior_spec(
             {
@@ -195,6 +233,185 @@ class FakeHTTPResponse:
 
     def __exit__(self, *args: object) -> None:
         return None
+
+
+class StaticGenerator:
+    model = "hf-cyber-test"
+    provider = "huggingface"
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self.delay = delay
+        self.calls = 0
+        self.rag_contexts: list[str] = []
+
+    def configured(self) -> bool:
+        return True
+
+    def generate(self, event: dict, rag_context: str = "") -> dict:
+        self.calls += 1
+        self.rag_contexts.append(rag_context)
+        if self.delay:
+            time.sleep(self.delay)
+        payload = event["payload"]
+        return {
+            "command": payload["command"],
+            "argv_match": {"mode": "prefix", "patterns": payload.get("argv", [])},
+            "response": {"stdout": "handled by shared cache\n", "stderr": ""},
+            "exit_status": 0,
+            "fs_effects": [],
+            "state_effects": {},
+        }
+
+
+class ScalarStateGenerator(StaticGenerator):
+    def generate(self, event: dict, rag_context: str = "") -> dict:
+        spec = super().generate(event, rag_context)
+        spec["state_effects"] = {"query_count": 2, "has_snapshot": True}
+        return spec
+
+
+class BadMatcherGenerator(StaticGenerator):
+    def generate(self, event: dict, rag_context: str = "") -> dict:
+        spec = super().generate(event, rag_context)
+        spec["argv_match"] = {"mode": "exact", "patterns": ["ss", "ss -a"]}
+        return spec
+
+
+class FakeEmbeddingClient:
+    model = "fake-embedding"
+
+    def __init__(self, embedding: list[float]) -> None:
+        self.embedding = embedding
+
+    def configured(self) -> bool:
+        return True
+
+    def embed(self, text: str) -> list[float]:
+        return self.embedding
+
+
+class AdaptiveLLMTests(unittest.TestCase):
+    def test_huggingface_provider_request_shape_and_response_parsing(self) -> None:
+        captured: dict[str, object] = {}
+        response_body = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"command":"systemctl",'
+                            '"argv_match":{"mode":"prefix","patterns":["status"]},'
+                            '"response":{"stdout":"active\\n","stderr":""},'
+                            '"exit_status":0,"fs_effects":[],"state_effects":{}}'
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeHTTPResponse(json.dumps(response_body).encode("utf-8"))
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ADAPTIVE_LLM_PROVIDER": "huggingface",
+                "ADAPTIVE_LLM_API_KEY": "test-key",
+                "ADAPTIVE_LLM_MODEL": "org/cyber-model",
+            },
+            clear=True,
+        ), mock.patch(
+            "cowrie.adaptive.llm_specs.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            spec = DeclarativeSpecGenerator(LLMClient()).generate(
+                {
+                    "payload": {
+                        "command": "systemctl",
+                        "argv": ["status"],
+                        "prior_sequence": [],
+                    }
+                }
+            )
+
+        self.assertEqual(spec["command"], "systemctl")
+        self.assertEqual(
+            captured["url"], "https://router.huggingface.co/v1/chat/completions"
+        )
+        body = captured["body"]
+        self.assertEqual(body["model"], "org/cyber-model")
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+
+    def test_missing_model_or_key_is_not_configured(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            generator = DeclarativeSpecGenerator(LLMClient())
+            self.assertFalse(generator.configured())
+            with self.assertRaises(SpecGenerationError):
+                generator.generate({"payload": {"command": "systemctl"}})
+
+    def test_can_omit_response_format_for_local_openai_servers(self) -> None:
+        captured: dict[str, object] = {}
+        response_body = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"command":"systemctl",'
+                            '"argv_match":{"mode":"prefix","patterns":["status"]},'
+                            '"response":{"stdout":"active\\n","stderr":""},'
+                            '"exit_status":0,"fs_effects":[],"state_effects":{}}'
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeHTTPResponse(json.dumps(response_body).encode("utf-8"))
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ADAPTIVE_LLM_API_KEY": "local-not-needed",
+                "ADAPTIVE_LLM_MODEL": "baron-local",
+                "ADAPTIVE_LLM_URL": "http://127.0.0.1:8080/v1/chat/completions",
+                "ADAPTIVE_LLM_RESPONSE_FORMAT": "",
+            },
+            clear=True,
+        ), mock.patch(
+            "cowrie.adaptive.llm_specs.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            DeclarativeSpecGenerator(LLMClient()).generate(
+                {"payload": {"command": "systemctl", "argv": ["status"]}}
+            )
+
+        self.assertNotIn("response_format", captured["body"])
+
+    def test_prompt_guides_empty_argv_matcher(self) -> None:
+        prompt = DeclarativeSpecGenerator(LLMClient())._prompt(
+            {"payload": {"command": "ss", "argv": [], "prior_sequence": []}}
+        )
+        self.assertIn("The triggering argv is exactly []", prompt)
+        self.assertIn(
+            'prefer argv_match: {"mode":"exact","patterns":[]}',
+            prompt,
+        )
+
+    def test_local_embedding_client_works_without_api_key(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"ADAPTIVE_EMBEDDING_PROVIDER": "local"},
+            clear=True,
+        ):
+            client = EmbeddingClient()
+            self.assertTrue(client.configured())
+            embedding = client.embed("ss -tulpn lists listening sockets")
+        self.assertEqual(len(embedding), 384)
+        self.assertTrue(any(value != 0 for value in embedding))
 
 
 class AdaptiveRegistryTests(unittest.TestCase):
@@ -286,6 +503,212 @@ class AdaptiveSidecarTests(unittest.TestCase):
         self.assertEqual(result["triage_reason"], "unknown_linux_command")
         self.assertEqual(store.patch_attempts, [])
         self.assertEqual(store.latest_behavior()["handlers"], [])
+
+    def test_shared_cache_pending_suppresses_duplicate_generation(self) -> None:
+        store = MemoryStore()
+        generator = StaticGenerator(delay=0.05)
+        first = AdaptiveSidecar(
+            store,
+            generator=generator,
+            rag_retriever=RagRetriever(store, enabled=False),
+        )
+        second = AdaptiveSidecar(
+            store,
+            generator=generator,
+            rag_retriever=RagRetriever(store, enabled=False),
+        )
+        event = {
+            "event_type": EVENT_COMMAND_MISSED,
+            "session_id": "session-cache-1",
+            "sequence_index": 1,
+            "sequence_hash": "cache",
+            "payload": {
+                "command": "systemctl",
+                "argv": ["status", "ssh"],
+                "prior_sequence": [
+                    {"command": "id", "argv": [], "cwd": "/root", "index": 1}
+                ],
+            },
+        }
+        first_result = first.receive_event(event)
+        second_result = second.receive_event({**event, "session_id": "session-cache-2"})
+        self.assertEqual(first_result["cache_status"], "miss")
+        self.assertEqual(second_result["cache_status"], "pending")
+        self.assertFalse(second_result["queued"])
+        for _attempt in range(50):
+            if generator.calls == 1 and store.latest_behavior()["handlers"]:
+                break
+            time.sleep(0.01)
+        self.assertEqual(generator.calls, 1)
+
+    def test_repeated_valid_miss_uses_cache_pending_not_duplicate_skip(self) -> None:
+        store = MemoryStore()
+        generator = StaticGenerator(delay=0.05)
+        sidecar = AdaptiveSidecar(
+            store,
+            generator=generator,
+            rag_retriever=RagRetriever(store, enabled=False),
+        )
+        event = {
+            "event_type": EVENT_COMMAND_MISSED,
+            "session_id": "session-repeat-1",
+            "sequence_index": 1,
+            "sequence_hash": "repeat",
+            "payload": {
+                "command": "ss",
+                "argv": ["-tupln"],
+                "prior_sequence": [],
+            },
+        }
+        first_result = sidecar.receive_event(event)
+        second_result = sidecar.receive_event({**event, "session_id": "session-repeat-2"})
+        self.assertEqual(first_result["cache_status"], "miss")
+        self.assertEqual(second_result["cache_status"], "pending")
+        self.assertEqual(second_result["status"], "cache_pending")
+
+    def test_published_spec_is_normalized_after_validation(self) -> None:
+        store = MemoryStore()
+        sidecar = AdaptiveSidecar(
+            store,
+            generator=ScalarStateGenerator(),
+            rag_retriever=RagRetriever(store, enabled=False),
+        )
+        sidecar.receive_event(
+            {
+                "event_type": EVENT_COMMAND_MISSED,
+                "session_id": "session-normalize-1",
+                "sequence_index": 1,
+                "sequence_hash": "normalize",
+                "payload": {
+                    "command": "ss",
+                    "argv": ["-tulpn"],
+                    "prior_sequence": [],
+                },
+            }
+        )
+        for _attempt in range(50):
+            if store.latest_behavior()["handlers"]:
+                break
+            time.sleep(0.01)
+        handler = store.latest_behavior()["handlers"][0]
+        self.assertEqual(
+            handler["state_effects"],
+            {"query_count": "2", "has_snapshot": "True"},
+        )
+
+    def test_narrows_generated_spec_that_does_not_match_triggering_argv(self) -> None:
+        store = MemoryStore()
+        sidecar = AdaptiveSidecar(
+            store,
+            generator=BadMatcherGenerator(),
+            rag_retriever=RagRetriever(store, enabled=False),
+        )
+        sidecar.receive_event(
+            {
+                "event_type": EVENT_COMMAND_MISSED,
+                "session_id": "session-bad-match-1",
+                "sequence_index": 1,
+                "sequence_hash": "bad-match",
+                "payload": {
+                    "command": "ss",
+                    "argv": [],
+                    "prior_sequence": [],
+                },
+            }
+        )
+        for _attempt in range(50):
+            if store.latest_behavior()["handlers"]:
+                break
+            time.sleep(0.01)
+        handlers = store.latest_behavior()["handlers"]
+        self.assertEqual(len(handlers), 1)
+        self.assertEqual(handlers[0]["argv_match"], {"mode": "exact", "patterns": []})
+        self.assertEqual(store.patch_attempts[-1]["status"], "accepted")
+
+    def test_cache_hit_avoids_llm_call_for_new_sidecar_instance(self) -> None:
+        store = MemoryStore()
+        generator = StaticGenerator()
+        sidecar = AdaptiveSidecar(
+            store,
+            generator=generator,
+            rag_retriever=RagRetriever(store, enabled=False),
+        )
+        event = {
+            "event_type": EVENT_COMMAND_MISSED,
+            "session_id": "session-cache-hit-1",
+            "sequence_index": 1,
+            "sequence_hash": "cache-hit",
+            "payload": {
+                "command": "systemctl",
+                "argv": ["status", "ssh"],
+                "prior_sequence": [],
+            },
+        }
+        sidecar.receive_event(event)
+        for _attempt in range(50):
+            if store.latest_behavior()["handlers"]:
+                break
+            time.sleep(0.01)
+        second = AdaptiveSidecar(
+            store,
+            generator=generator,
+            rag_retriever=RagRetriever(store, enabled=False),
+        )
+        result = second.receive_event({**event, "session_id": "session-cache-hit-2"})
+        self.assertEqual(result["cache_status"], "hit")
+        self.assertEqual(generator.calls, 1)
+
+    def test_rag_context_is_injected_into_generation_prompt(self) -> None:
+        store = MemoryStore()
+        source_id = store.add_rag_source("unit", "test")
+        store.add_rag_chunk(
+            source_id,
+            "systemctl status ssh shows Loaded and Active fields.",
+            [1.0, 0.0],
+            {"command": "systemctl"},
+        )
+        generator = StaticGenerator()
+        sidecar = AdaptiveSidecar(
+            store,
+            generator=generator,
+            rag_retriever=RagRetriever(
+                store,
+                embedding_client=FakeEmbeddingClient([1.0, 0.0]),
+            ),
+        )
+        sidecar.receive_event(
+            {
+                "event_type": EVENT_COMMAND_MISSED,
+                "session_id": "session-rag-1",
+                "sequence_index": 1,
+                "sequence_hash": "rag",
+                "payload": {
+                    "command": "systemctl",
+                    "argv": ["status", "ssh"],
+                    "prior_sequence": [],
+                },
+            }
+        )
+        for _attempt in range(50):
+            if generator.rag_contexts:
+                break
+            time.sleep(0.01)
+        self.assertIn("systemctl status ssh", generator.rag_contexts[0])
+        self.assertEqual(store.rag_queries[0]["chunk_ids"], [1])
+
+    def test_debug_rag_returns_store_stats(self) -> None:
+        store = MemoryStore()
+        source_id = store.add_rag_source("unit", "test")
+        store.add_rag_chunk(source_id, "ss lists sockets", [1.0], {"command": "ss"})
+        sidecar = AdaptiveSidecar(
+            store,
+            generator=StaticGenerator(),
+            rag_retriever=RagRetriever(store, enabled=False),
+        )
+        stats = sidecar.debug_rag()
+        self.assertEqual(stats["sources"], 1)
+        self.assertEqual(stats["chunks"], 1)
+        self.assertEqual(stats["queries"], 0)
 
 
 if __name__ == "__main__":

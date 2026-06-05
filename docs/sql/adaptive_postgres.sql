@@ -71,6 +71,51 @@ CREATE TABLE IF NOT EXISTS adaptive.behavior_specs (
 CREATE INDEX IF NOT EXISTS behavior_specs_active_index
   ON adaptive.behavior_specs(status, version);
 
+CREATE TABLE IF NOT EXISTS adaptive.handler_cache (
+  cache_key TEXT PRIMARY KEY,
+  command TEXT NOT NULL,
+  argv_fingerprint TEXT NOT NULL,
+  status TEXT NOT NULL,
+  behavior_spec_id BIGINT REFERENCES adaptive.behavior_specs(id),
+  hit_count INTEGER NOT NULL DEFAULT 0,
+  last_hit_at TIMESTAMPTZ,
+  failure_reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS handler_cache_status_index
+  ON adaptive.handler_cache(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS adaptive.rag_sources (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  version TEXT NOT NULL DEFAULT '',
+  uri TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS adaptive.rag_chunks (
+  id BIGSERIAL PRIMARY KEY,
+  source_id BIGINT NOT NULL REFERENCES adaptive.rag_sources(id),
+  chunk_text TEXT NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  embedding JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS rag_chunks_metadata_gin
+  ON adaptive.rag_chunks USING GIN (metadata);
+
+CREATE TABLE IF NOT EXISTS adaptive.rag_queries (
+  id BIGSERIAL PRIMARY KEY,
+  session_id TEXT REFERENCES adaptive.sessions(id),
+  query_text TEXT NOT NULL,
+  retrieved_chunk_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+  similarity_scores JSONB NOT NULL DEFAULT '[]'::jsonb,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS adaptive.patch_attempts (
   id BIGSERIAL PRIMARY KEY,
   session_id TEXT REFERENCES adaptive.sessions(id),
@@ -82,3 +127,8 @@ CREATE TABLE IF NOT EXISTS adaptive.patch_attempts (
   status TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE adaptive.patch_attempts
+  ADD COLUMN IF NOT EXISTS cache_key TEXT,
+  ADD COLUMN IF NOT EXISTS cache_status TEXT,
+  ADD COLUMN IF NOT EXISTS rag_status TEXT NOT NULL DEFAULT 'not_requested';
