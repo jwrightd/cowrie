@@ -24,6 +24,7 @@ from cowrie.adaptive.llm_specs import (
     DeclarativeSpecGenerator,
     LLMClient,
     SpecGenerationError,
+    loads_llm_json,
 )
 from cowrie.adaptive.rag import EmbeddingClient, RagRetriever
 from cowrie.adaptive.sidecar import AdaptiveSidecar
@@ -44,9 +45,14 @@ PROMPT = b"root@unitTest:~# "
 class MemoryClient:
     def __init__(self) -> None:
         self.events: list[dict] = []
+        self.sync_response: dict | None = None
 
     def send_event(self, event: dict) -> None:
         self.events.append(event)
+
+    def send_event_sync(self, event: dict) -> dict | None:
+        self.events.append(event)
+        return self.sync_response
 
     def report_reload_result(self, result: dict) -> None:
         pass
@@ -99,6 +105,23 @@ class AdaptiveCowrieTests(unittest.TestCase):
             "unknownadaptive",
         )
 
+    def test_unknown_command_can_use_immediate_adaptive_response(self) -> None:
+        self.client.sync_response = {
+            "status": "accepted",
+            "spec": {
+                "command": "unknownadaptive",
+                "argv_match": {"mode": "exact", "patterns": ["--probe"]},
+                "response": {"stdout": "generated now\n", "stderr": ""},
+                "exit_status": 0,
+                "fs_effects": [],
+                "state_effects": {},
+            },
+        }
+        self.proto.lineReceived(b"unknownadaptive --probe\n")
+        self.assertEqual(self.tr.value(), b"generated now\n" + PROMPT)
+        self.assertIn(EVENT_COMMAND_MISSED, self.event_types())
+        self.assertIn(EVENT_COMMAND_HANDLED, self.event_types())
+
     def test_adaptive_spec_handles_unknown_command(self) -> None:
         registry.load_for_tests(
             [
@@ -121,6 +144,28 @@ class AdaptiveCowrieTests(unittest.TestCase):
         )
         self.assertNotIn(EVENT_COMMAND_MISSED, self.event_types())
         self.assertEqual(self.proto.adaptive_state["last_adaptive"], "unknownadaptive")
+
+    def test_adaptive_spec_adds_missing_response_newline(self) -> None:
+        registry.load_for_tests(
+            [
+                {
+                    "command": "unknownadaptive",
+                    "argv_match": {"mode": "prefix", "patterns": ["--bad"]},
+                    "response": {
+                        "stdout": "",
+                        "stderr": "unknownadaptive: option --bad requires an argument",
+                    },
+                    "exit_status": 1,
+                    "fs_effects": [],
+                    "state_effects": {},
+                }
+            ]
+        )
+        self.proto.lineReceived(b"unknownadaptive --bad\n")
+        self.assertEqual(
+            self.tr.value(),
+            b"unknownadaptive: option --bad requires an argument\n" + PROMPT,
+        )
 
     def test_adaptive_spec_can_create_fake_file(self) -> None:
         registry.load_for_tests(
@@ -400,6 +445,19 @@ class AdaptiveLLMTests(unittest.TestCase):
             'prefer argv_match: {"mode":"exact","patterns":[]}',
             prompt,
         )
+        self.assertIn("escaped newlines like \\n", prompt)
+
+    def test_llm_json_loader_extracts_object_from_extra_text(self) -> None:
+        spec = loads_llm_json(
+            'Here is the JSON:\n{"command":"lsof","response":{"stdout":"ok\\n"}}\nDone.'
+        )
+        self.assertEqual(spec["command"], "lsof")
+
+    def test_llm_json_loader_escapes_raw_newlines_inside_strings(self) -> None:
+        spec = loads_llm_json(
+            '{"command":"lsof","response":{"stdout":"COMMAND PID\nsshd 713\n"}}'
+        )
+        self.assertEqual(spec["response"]["stdout"], "COMMAND PID\nsshd 713\n")
 
     def test_local_embedding_client_works_without_api_key(self) -> None:
         with mock.patch.dict(
@@ -656,6 +714,32 @@ class AdaptiveSidecarTests(unittest.TestCase):
         )
         result = second.receive_event({**event, "session_id": "session-cache-hit-2"})
         self.assertEqual(result["cache_status"], "hit")
+        self.assertEqual(generator.calls, 1)
+
+    def test_waiting_miss_returns_generated_spec(self) -> None:
+        store = MemoryStore()
+        generator = StaticGenerator()
+        sidecar = AdaptiveSidecar(
+            store,
+            generator=generator,
+            rag_retriever=RagRetriever(store, enabled=False),
+        )
+        result = sidecar.receive_event(
+            {
+                "event_type": EVENT_COMMAND_MISSED,
+                "session_id": "session-wait-1",
+                "sequence_index": 1,
+                "sequence_hash": "wait",
+                "payload": {
+                    "command": "lsof",
+                    "argv": ["-i"],
+                    "prior_sequence": [],
+                },
+            },
+            wait=True,
+        )
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["spec"]["command"], "lsof")
         self.assertEqual(generator.calls, 1)
 
     def test_rag_context_is_injected_into_generation_prompt(self) -> None:

@@ -285,9 +285,15 @@ class AdaptiveCommand(HoneyPotCommand):
     def call(self) -> None:
         self._apply_fs_effects()
         if self.spec.response.stdout:
-            self.write(render_template(self.spec.response.stdout, self))
+            self.write(
+                _with_trailing_newline(
+                    render_template(self.spec.response.stdout, self)
+                )
+            )
         if self.spec.response.stderr:
-            self.errorWrite(render_template(self.spec.response.stderr, self))
+            self.errorWrite(
+                _with_trailing_newline(render_template(self.spec.response.stderr, self))
+            )
         state = getattr(self.protocol, "adaptive_state", None)
         if state is None:
             state = {}
@@ -311,6 +317,12 @@ class AdaptiveCommand(HoneyPotCommand):
                     file_obj[fs.A_CONTENTS] = content
             except (fs.FileNotFound, fs.PermissionDenied, OSError) as e:
                 log.msg(f"adaptive fs_effect failed for {effect.path}: {e!r}")
+
+
+def _with_trailing_newline(value: str) -> str:
+    if value and not value.endswith(("\n", "\r")):
+        return f"{value}\n"
+    return value
 
 
 def command_class_for_spec(spec: BehaviorSpec) -> type[AdaptiveCommand]:

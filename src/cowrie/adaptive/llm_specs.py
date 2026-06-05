@@ -59,7 +59,7 @@ class LLMClient:
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             response_data = json.loads(response.read().decode("utf-8"))
         content = response_data["choices"][0]["message"]["content"]
-        return json.loads(content)
+        return loads_llm_json(content)
 
 
 class DeclarativeSpecGenerator:
@@ -90,7 +90,9 @@ class DeclarativeSpecGenerator:
                         "when no effects are needed. state_effects must be a JSON "
                         "object whose keys and values are strings. argv_match must "
                         "match the missed command argv exactly enough to pass "
-                        "validation. Do not include the command name in argv_match."
+                        "validation. Do not include the command name in argv_match. "
+                        "Escape newlines inside stdout and stderr as \\n; never put "
+                        "literal line breaks inside JSON strings."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -126,7 +128,88 @@ class DeclarativeSpecGenerator:
             "session-local state effects. If there are no filesystem or state "
             "effects, set fs_effects to [] and state_effects to {}. argv_match "
             "must be a JSON object with mode one of any, exact, prefix, contains "
-            "and patterns as a list of strings.\n"
+            "and patterns as a list of strings. stdout and stderr must be JSON "
+            "strings with escaped newlines like \\n, not raw multiline strings.\n"
             f"{rag_section}\n"
             f"{as_non_instruction_context(payload)}"
         )
+
+
+def loads_llm_json(content: str) -> dict[str, Any]:
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        extracted = _extract_json_object(content)
+        if extracted != content:
+            return json.loads(extracted)
+        repaired = _escape_control_chars_in_strings(content)
+        if repaired != content:
+            return json.loads(repaired)
+        raise
+
+
+def _extract_json_object(content: str) -> str:
+    start = content.find("{")
+    if start < 0:
+        return content
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(content)):
+        char = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return content[start : index + 1]
+    return content
+
+
+def _escape_control_chars_in_strings(content: str) -> str:
+    result = []
+    in_string = False
+    escaped = False
+    changed = False
+    for char in content:
+        if in_string:
+            if escaped:
+                result.append(char)
+                escaped = False
+                continue
+            if char == "\\":
+                result.append(char)
+                escaped = True
+                continue
+            if char == '"':
+                in_string = False
+                result.append(char)
+                continue
+            if char == "\n":
+                result.append("\\n")
+                changed = True
+                continue
+            if char == "\r":
+                result.append("\\r")
+                changed = True
+                continue
+            if char == "\t":
+                result.append("\\t")
+                changed = True
+                continue
+            result.append(char)
+            continue
+        result.append(char)
+        if char == '"':
+            in_string = True
+    return "".join(result) if changed else content

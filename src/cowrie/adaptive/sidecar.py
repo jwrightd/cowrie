@@ -37,7 +37,7 @@ class AdaptiveSidecar:
         self.rag_retriever = rag_retriever or RagRetriever(store)
         self.recent_results: list[dict[str, Any]] = []
 
-    def receive_event(self, event: dict[str, Any]) -> dict[str, Any]:
+    def receive_event(self, event: dict[str, Any], wait: bool = False) -> dict[str, Any]:
         self.store.store_event(event)
         response = {"stored": True, "queued": False}
         if event.get("event_type") != EVENT_COMMAND_MISSED or self.store.frozen:
@@ -65,6 +65,9 @@ class AdaptiveSidecar:
         response.update({"cache_key": cache_key, "cache_status": cache_status})
         if cache_status == "hit":
             response["status"] = "cache_hit"
+            spec = self.store.behavior_spec_by_id(cache_entry.get("behavior_spec_id"))
+            if spec is not None:
+                response["spec"] = spec
             self._remember(
                 {
                     **response,
@@ -113,6 +116,9 @@ class AdaptiveSidecar:
                 "session_id": event.get("session_id"),
             }
         )
+        if wait:
+            result = self._generate_and_publish(event, attempt, cache_key)
+            return {**response, **result}
         threading.Thread(
             target=self._generate_and_publish,
             args=(event, attempt, cache_key),
@@ -122,7 +128,7 @@ class AdaptiveSidecar:
 
     def _generate_and_publish(
         self, event: dict[str, Any], attempt: dict[str, Any], cache_key: str
-    ) -> None:
+    ) -> dict[str, Any]:
         try:
             rag_result = self.rag_retriever.retrieve(event)
             attempt["rag_status"] = rag_result.status
@@ -138,63 +144,61 @@ class AdaptiveSidecar:
             attempt["status"] = "queued_no_llm"
             self.store.record_patch_attempt(attempt)
             self.store.mark_handler_cache_failed(cache_key, "queued_no_llm")
-            self._remember(
-                {
-                    "stored": True,
-                    "queued": True,
-                    "status": "queued_no_llm",
-                    "command": event.get("payload", {}).get("command", ""),
-                    "session_id": event.get("session_id"),
-                }
-            )
-            return
+            result = {
+                "stored": True,
+                "queued": True,
+                "status": "queued_no_llm",
+                "command": event.get("payload", {}).get("command", ""),
+                "session_id": event.get("session_id"),
+            }
+            self._remember(result)
+            return result
         except (OSError, json.JSONDecodeError, KeyError, SpecValidationError) as e:
             attempt["validator_failures"] = [repr(e)]
             attempt["status"] = "rejected"
             self.store.record_patch_attempt(attempt)
             self.store.mark_handler_cache_failed(cache_key, repr(e))
-            self._remember(
-                {
-                    "stored": True,
-                    "queued": True,
-                    "status": "rejected",
-                    "error": repr(e),
-                    "command": event.get("payload", {}).get("command", ""),
-                    "session_id": event.get("session_id"),
-                }
-            )
-            return
+            result = {
+                "stored": True,
+                "queued": True,
+                "status": "rejected",
+                "error": repr(e),
+                "command": event.get("payload", {}).get("command", ""),
+                "session_id": event.get("session_id"),
+            }
+            self._remember(result)
+            return result
         except Exception as e:
             attempt["validator_failures"] = [traceback.format_exc()]
             attempt["status"] = "error"
             self.store.record_patch_attempt(attempt)
             self.store.mark_handler_cache_failed(cache_key, repr(e))
-            self._remember(
-                {
-                    "stored": True,
-                    "queued": True,
-                    "status": "error",
-                    "error": repr(e),
-                    "command": event.get("payload", {}).get("command", ""),
-                    "session_id": event.get("session_id"),
-                }
-            )
-            return
+            result = {
+                "stored": True,
+                "queued": True,
+                "status": "error",
+                "error": repr(e),
+                "command": event.get("payload", {}).get("command", ""),
+                "session_id": event.get("session_id"),
+            }
+            self._remember(result)
+            return result
 
         attempt["generated_spec"] = spec
         attempt["status"] = "accepted"
         self.store.record_patch_attempt(attempt)
         version = self.store.publish_behavior_spec(spec, cache_key=cache_key)
-        self._remember(
-            {
-                "stored": True,
-                "queued": True,
-                "status": "accepted",
-                "version": version,
-                "command": spec.get("command", ""),
-                "session_id": event.get("session_id"),
-            }
-        )
+        result = {
+            "stored": True,
+            "queued": True,
+            "status": "accepted",
+            "version": version,
+            "spec": spec,
+            "command": spec.get("command", ""),
+            "session_id": event.get("session_id"),
+        }
+        self._remember(result)
+        return result
 
     def latest_behavior(self, since_version: int = 0) -> dict[str, Any]:
         return self.store.latest_behavior(since_version=since_version)
@@ -243,8 +247,15 @@ def make_handler(sidecar: AdaptiveSidecar) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             body = self._read_json()
             path = urlparse(self.path).path
+            query = parse_qs(urlparse(self.path).query)
             if path == "/events":
-                self._write_json(sidecar.receive_event(body))
+                wait = query.get("wait", ["false"])[0].lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                self._write_json(sidecar.receive_event(body, wait=wait))
             elif path == "/behavior/reload-result":
                 self._write_json(sidecar.reload_result(body))
             elif path == "/control/freeze":

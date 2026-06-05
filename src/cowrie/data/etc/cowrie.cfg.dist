@@ -940,6 +940,11 @@ sidecar_url = http://127.0.0.1:8088
 timeout = 2.0
 behavior_poll_interval = 1.0
 behavior_file =
+# If true, Cowrie waits on command_missed for the sidecar to generate and
+# return an approved handler before showing "command not found". Keep the
+# timeout bounded so attackers do not hang the shell if the LLM is unavailable.
+respond_on_miss = false
+miss_response_timeout = 15.0
 
 # MongoDB logging module
 #

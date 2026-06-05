@@ -24,18 +24,40 @@ class SidecarClient:
             "adaptive", "sidecar_url", fallback="http://127.0.0.1:8088"
         ).rstrip("/")
         self.timeout = CowrieConfig.getfloat("adaptive", "timeout", fallback=2.0)
+        self.respond_on_miss = CowrieConfig.getboolean(
+            "adaptive", "respond_on_miss", fallback=False
+        )
+        self.miss_response_timeout = CowrieConfig.getfloat(
+            "adaptive", "miss_response_timeout", fallback=15.0
+        )
 
     def send_event(self, event: dict[str, Any]) -> None:
         if not self.enabled:
             return
         reactor.callInThread(self._post_json, "/events", event)
 
+    def send_event_sync(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.enabled or not self.respond_on_miss:
+            return None
+        return self._post_json(
+            "/events?wait=true",
+            event,
+            timeout=self.miss_response_timeout,
+            expect_response=True,
+        )
+
     def report_reload_result(self, result: dict[str, Any]) -> None:
         if not self.enabled:
             return
         reactor.callInThread(self._post_json, "/behavior/reload-result", result)
 
-    def _post_json(self, path: str, body: dict[str, Any]) -> None:
+    def _post_json(
+        self,
+        path: str,
+        body: dict[str, Any],
+        timeout: float | None = None,
+        expect_response: bool = False,
+    ) -> dict[str, Any] | None:
         data = json.dumps(body, sort_keys=True).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}{path}",
@@ -44,7 +66,14 @@ class SidecarClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                response.read()
+            with urllib.request.urlopen(
+                request, timeout=self.timeout if timeout is None else timeout
+            ) as response:
+                raw = response.read()
+                if expect_response:
+                    return json.loads(raw.decode("utf-8"))
         except (OSError, urllib.error.URLError) as e:
             log.msg(f"adaptive sidecar request failed: {e!r}")
+        except (KeyError, json.JSONDecodeError) as e:
+            log.msg(f"adaptive sidecar response parse failed: {e!r}")
+        return None

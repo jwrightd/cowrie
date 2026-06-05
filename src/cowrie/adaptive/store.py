@@ -99,6 +99,14 @@ class MemoryStore:
             entry["status"] = "failed"
             entry["failure_reason"] = reason
 
+    def behavior_spec_by_id(self, behavior_spec_id: int | None) -> dict[str, Any] | None:
+        if behavior_spec_id is None:
+            return None
+        for spec in self.behavior_specs:
+            if int(spec.get("id", 0)) == behavior_spec_id:
+                return dict(spec)
+        return None
+
     def add_rag_source(
         self, name: str, source_type: str, version: str = "", uri: str = ""
     ) -> int:
@@ -416,6 +424,24 @@ class PostgresStore:
                 """,
                 (reason, cache_key),
             )
+
+    def behavior_spec_by_id(self, behavior_spec_id: int | None) -> dict[str, Any] | None:
+        if behavior_spec_id is None:
+            return None
+        with self.conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, version, spec
+                FROM adaptive.behavior_specs
+                WHERE id = %s
+                  AND status = 'active'
+                """,
+                (behavior_spec_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return dict(row["spec"], id=row["id"], version=row["version"])
 
     def add_rag_source(
         self, name: str, source_type: str, version: str = "", uri: str = ""

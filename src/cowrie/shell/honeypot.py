@@ -17,7 +17,12 @@ from twisted.python import failure, log
 from twisted.python.compat import iterbytes
 
 from cowrie.adaptive.cowrie_adapter import get_adapter
-from cowrie.adaptive.spec import registry as adaptive_registry
+from cowrie.adaptive.spec import (
+    SpecValidationError,
+    command_class_for_spec,
+    parse_behavior_spec,
+    registry as adaptive_registry,
+)
 from cowrie.core.config import CowrieConfig
 from cowrie.shell import fs
 from cowrie.shell.parser import CommandParser
@@ -494,50 +499,95 @@ class HoneyPotShell:
                     )
                     lastpp = pp
             else:
-                get_adapter().command_missed(
+                response = get_adapter().command_missed(
                     self.protocol,
                     cmd["command"],
                     cmd["rargs"],
                     observed_sequences.get(index),
                 )
-                log.msg(
-                    eventid="cowrie.command.failed",
-                    input=cmd["command"] + " " + " ".join(cmd["rargs"]),
-                    format="Command not found: %(input)s",
-                )
-                message = "-bash: {}: command not found\n".format(
-                    cmd["command"]
-                ).encode("utf8")
-                redirects = cmd.get("redirects", [])
-                if redirects:
-                    temp_pp = PipeProtocol(
-                        self.protocol,
-                        None,
-                        [],
-                        None,
-                        None,
-                        self.redirect,
-                        redirects,
-                    )
-                    temp_pp.errReceived(message)
-                    for real_path, virtual_path in temp_pp.redirect_real_files:
-                        self.protocol.terminal.redirFiles.add((real_path, virtual_path))
+                spec_data = response.get("spec") if isinstance(response, dict) else None
+                if isinstance(spec_data, dict):
+                    try:
+                        cmdclass = command_class_for_spec(parse_behavior_spec(spec_data))
+                    except SpecValidationError as e:
+                        log.msg(f"adaptive immediate spec rejected locally: {e!r}")
+                    else:
+                        get_adapter().command_handled(
+                            self.protocol,
+                            cmd["command"],
+                            cmd["rargs"],
+                            getattr(cmdclass, "__name__", repr(cmdclass)),
+                        )
+                        log.msg(
+                            eventid="cowrie.adaptive.command.immediate",
+                            input=cmd["command"] + " " + " ".join(cmd["rargs"]),
+                            format="Adaptive immediate command: %(input)s",
+                        )
+
+                if cmdclass:
+                    if index == len(cmd_array) - 1:
+                        lastpp = PipeProtocol(
+                            self.protocol,
+                            cmdclass,
+                            cmd["rargs"],
+                            None,
+                            None,
+                            self.redirect,
+                            cmd.get("redirects", []),
+                        )
+                        pp = lastpp
+                    else:
+                        pp = PipeProtocol(
+                            self.protocol,
+                            cmdclass,
+                            cmd["rargs"],
+                            None,
+                            lastpp,
+                            self.redirect,
+                            cmd.get("redirects", []),
+                        )
+                        lastpp = pp
                 else:
-                    self.protocol.terminal.write(message)
+                    log.msg(
+                        eventid="cowrie.command.failed",
+                        input=cmd["command"] + " " + " ".join(cmd["rargs"]),
+                        format="Command not found: %(input)s",
+                    )
+                    message = "-bash: {}: command not found\n".format(
+                        cmd["command"]
+                    ).encode("utf8")
+                    redirects = cmd.get("redirects", [])
+                    if redirects:
+                        temp_pp = PipeProtocol(
+                            self.protocol,
+                            None,
+                            [],
+                            None,
+                            None,
+                            self.redirect,
+                            redirects,
+                        )
+                        temp_pp.errReceived(message)
+                        for real_path, virtual_path in temp_pp.redirect_real_files:
+                            self.protocol.terminal.redirFiles.add(
+                                (real_path, virtual_path)
+                            )
+                    else:
+                        self.protocol.terminal.write(message)
 
-                # Import here to avoid circular dependency with protocol module
-                from cowrie.shell import protocol
+                    # Import here to avoid circular dependency with protocol module
+                    from cowrie.shell import protocol
 
-                if (
-                    isinstance(self.protocol, protocol.HoneyPotExecProtocol)
-                    and not self.cmdpending
-                ):
-                    exit_status = failure.Failure(error.ProcessDone(status=""))
-                    self.protocol.terminal.transport.processEnded(exit_status)
+                    if (
+                        isinstance(self.protocol, protocol.HoneyPotExecProtocol)
+                        and not self.cmdpending
+                    ):
+                        exit_status = failure.Failure(error.ProcessDone(status=""))
+                        self.protocol.terminal.transport.processEnded(exit_status)
 
-                runOrPrompt()
-                pp = None  # Got a error. Don't run any piped commands
-                break
+                    runOrPrompt()
+                    pp = None  # Got a error. Don't run any piped commands
+                    break
         if pp and getattr(pp, "has_redirection_error", False):
             runOrPrompt()
             return

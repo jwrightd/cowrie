@@ -107,7 +107,7 @@ class CowrieAdaptiveAdapter:
         command: str,
         argv: list[str],
         commands: list[dict[str, Any]] | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         payload = {
             "command": command,
             "argv": list(argv),
@@ -117,7 +117,9 @@ class CowrieAdaptiveAdapter:
             if commands is not None
             else self.tracker.commands(session_id_from_protocol(protocol)),
         }
-        self._emit(protocol, EVENT_COMMAND_MISSED, payload)
+        return self._emit(
+            protocol, EVENT_COMMAND_MISSED, payload, expect_response=True
+        )
 
     def _emit(
         self,
@@ -126,7 +128,8 @@ class CowrieAdaptiveAdapter:
         payload: dict[str, Any],
         sequence_index: int | None = None,
         seq_hash: str | None = None,
-    ) -> None:
+        expect_response: bool = False,
+    ) -> dict[str, Any] | None:
         session_id = session_id_from_protocol(protocol)
         if sequence_index is None or seq_hash is None:
             sequence_index, seq_hash, _commands = self.tracker.snapshot(session_id)
@@ -146,7 +149,10 @@ class CowrieAdaptiveAdapter:
             adaptive_payload=payload,
             format="Adaptive event: %(adaptive_event_type)s %(adaptive_session)s",
         )
+        if expect_response:
+            return self.client.send_event_sync(event_dict)
         self.client.send_event(event_dict)
+        return None
 
 
 _adapter = CowrieAdaptiveAdapter()
